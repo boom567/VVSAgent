@@ -1,0 +1,12 @@
+#!/bin/zsh
+
+set -e
+
+PROJECT_DIR="/Users/Zhuanz/Project/PythonProject/agent"
+CONDA_ROOT="/Users/Zhuanz/miniconda3"
+
+source "$CONDA_ROOT/etc/profile.d/conda.sh"
+conda activate agent
+
+cd "$PROJECT_DIR"
+exec python aiagent.py
