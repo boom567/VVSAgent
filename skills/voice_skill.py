@@ -38,6 +38,14 @@ class VoiceState(Enum):
     EXITING = auto()
 
 
+class ListeningPhase(Enum):
+    WAITING_FOR_SPEECH = auto()
+    CAPTURING_SPEECH = auto()
+    COMPLETED = auto()
+    NO_INPUT = auto()
+    ERROR = auto()
+
+
 @dataclass
 class VoiceTurnResult:
     audio_path: Path | None = None
@@ -102,6 +110,119 @@ def _transcribe_audio_path(target: Path, language: str):
         return "", f"Speech recognition service error: {exc}"
 
 
+class MicrophoneListeningSession:
+    def __init__(
+        self,
+        target: Path,
+        language: str,
+        sample_rate: int,
+        silence_seconds: float,
+        wait_for_speech_seconds: float,
+        partial_update_seconds: float,
+        volume_threshold: float,
+    ):
+        self.target = target
+        self.language = language
+        self.sample_rate = sample_rate
+        self.silence_seconds = silence_seconds
+        self.wait_for_speech_seconds = wait_for_speech_seconds
+        self.partial_update_seconds = partial_update_seconds
+        self.volume_threshold = volume_threshold
+        self.phase = ListeningPhase.WAITING_FOR_SPEECH
+        self.frames = []
+        self.partial_text = ""
+        self.partial_lock = threading.Lock()
+        self.last_voice_time = None
+        self.start_time = time.time()
+        self.last_partial_check = 0.0
+
+    def _transition(self, phase: ListeningPhase):
+        self.phase = phase
+
+    def _append_audio_frame(self, mono_frame):
+        self.frames.append(mono_frame)
+        volume = float(np.sqrt(np.mean(np.square(mono_frame)))) if len(mono_frame) else 0.0
+        now = time.time()
+        if volume >= self.volume_threshold:
+            self._transition(ListeningPhase.CAPTURING_SPEECH)
+            self.last_voice_time = now
+
+    def _callback(self, indata, frames_count, time_info, status):
+        if status:
+            print(f"\n[Voice status] {status}")
+
+        mono = indata[:, 0].copy()
+        self._append_audio_frame(mono)
+
+    def _maybe_emit_partial_transcript(self, now: float):
+        if self.phase != ListeningPhase.CAPTURING_SPEECH:
+            return
+        if now - self.last_partial_check < self.partial_update_seconds or not self.frames:
+            return
+
+        self.last_partial_check = now
+        samples = np.concatenate(self.frames, axis=0)
+        if len(samples) < int(self.sample_rate * 0.8):
+            return
+
+        recognized = _recognize_audio_data(_audio_samples_to_audio_data(samples, self.sample_rate), self.language)
+        if not recognized or recognized.startswith("[Speech service error:"):
+            return
+
+        with self.partial_lock:
+            if recognized != self.partial_text:
+                self.partial_text = recognized
+                print(f"\r[Voice Text] {recognized}", end="", flush=True)
+
+    def _should_stop_waiting(self, now: float):
+        return now - self.start_time >= self.wait_for_speech_seconds
+
+    def _should_stop_capturing(self, now: float):
+        return self.last_voice_time is not None and now - self.last_voice_time >= self.silence_seconds
+
+    def _finalize_audio(self):
+        samples = np.concatenate(self.frames, axis=0) if self.frames else np.array([], dtype="float32")
+        if samples.size == 0:
+            self._transition(ListeningPhase.NO_INPUT)
+            return VoiceTurnResult(message="No speech detected.", no_input=True)
+
+        sf.write(str(self.target), samples, self.sample_rate, subtype="PCM_16")
+        print()
+        self._transition(ListeningPhase.COMPLETED)
+        return VoiceTurnResult(audio_path=self.target)
+
+    def run(self):
+        try:
+            print("[Voice] Listening... Start speaking.")
+            with sd.InputStream(samplerate=self.sample_rate, channels=1, dtype="float32", callback=self._callback):
+                while True:
+                    now = time.time()
+
+                    if self.phase == ListeningPhase.WAITING_FOR_SPEECH:
+                        if self._should_stop_waiting(now):
+                            self._transition(ListeningPhase.NO_INPUT)
+                            return VoiceTurnResult(message="No speech detected.", no_input=True)
+                        time.sleep(0.05)
+                        continue
+
+                    self._maybe_emit_partial_transcript(now)
+
+                    if self.phase == ListeningPhase.CAPTURING_SPEECH and self._should_stop_capturing(now):
+                        break
+
+                    time.sleep(0.05)
+
+            return self._finalize_audio()
+        except Exception as exc:
+            self._transition(ListeningPhase.ERROR)
+            return VoiceTurnResult(
+                message=(
+                    "Microphone recording failed. Check macOS microphone permissions and audio device availability. "
+                    f"Details: {exc}"
+                )
+            )
+
+
 def _record_until_silence(
     target: Path,
     language: str,
@@ -111,70 +232,16 @@ def _record_until_silence(
     partial_update_seconds: float,
     volume_threshold: float,
 ):
-    frames = []
-    state = {
-        "speech_started": False,
-        "last_voice_time": None,
-        "start_time": time.time(),
-    }
-    partial_text = {"value": ""}
-    partial_lock = threading.Lock()
-    last_partial_check = 0.0
-
-    def callback(indata, frames_count, time_info, status):
-        if status:
-            print(f"\n[Voice status] {status}")
-
-        mono = indata[:, 0].copy()
-        frames.append(mono)
-        volume = float(np.sqrt(np.mean(np.square(mono)))) if len(mono) else 0.0
-        now = time.time()
-        if volume >= volume_threshold:
-            state["speech_started"] = True
-            state["last_voice_time"] = now
-
-    try:
-        print("[Voice] Listening... Start speaking.")
-        with sd.InputStream(samplerate=sample_rate, channels=1, dtype="float32", callback=callback):
-            while True:
-                now = time.time()
-
-                if not state["speech_started"]:
-                    if now - state["start_time"] >= wait_for_speech_seconds:
-                        return VoiceTurnResult(message="No speech detected.", no_input=True)
-                    time.sleep(0.05)
-                    continue
-
-                if now - last_partial_check >= partial_update_seconds and frames:
-                    last_partial_check = now
-                    samples = np.concatenate(frames, axis=0)
-                    if len(samples) >= int(sample_rate * 0.8):
-                        recognized = _recognize_audio_data(_audio_samples_to_audio_data(samples, sample_rate), language)
-                        if recognized and not recognized.startswith("[Speech service error:"):
-                            with partial_lock:
-                                if recognized != partial_text["value"]:
-                                    partial_text["value"] = recognized
-                                    print(f"\r[Voice Text] {recognized}", end="", flush=True)
-
-                if state["last_voice_time"] and now - state["last_voice_time"] >= silence_seconds:
-                    break
-
-                time.sleep(0.05)
-
-        samples = np.concatenate(frames, axis=0) if frames else np.array([], dtype="float32")
-        if samples.size == 0:
-            return VoiceTurnResult(message="No speech detected.", no_input=True)
-
-        sf.write(str(target), samples, sample_rate, subtype="PCM_16")
-        print()
-        return VoiceTurnResult(audio_path=target)
-    except Exception as exc:
-        return VoiceTurnResult(
-            message=(
-                "Microphone recording failed. Check macOS microphone permissions and audio device availability. "
-                f"Details: {exc}"
-            )
-        )
+    session = MicrophoneListeningSession(
+        target=target,
+        language=language,
+        sample_rate=sample_rate,
+        silence_seconds=silence_seconds,
+        wait_for_speech_seconds=wait_for_speech_seconds,
+        partial_update_seconds=partial_update_seconds,
+        volume_threshold=volume_threshold,
+    )
+    return session.run()
 
 
 class VoiceConversationStateMachine:
