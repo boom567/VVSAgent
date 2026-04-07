@@ -4,13 +4,15 @@ from datetime import datetime
 from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib import parse, request
+from urllib import parse, request, error
+import xml.etree.ElementTree as ET
 import json
 import re
 
 
 WEB_FINDINGS_DIR = Path(__file__).resolve().parent.parent / "knowledge_base" / "web_findings"
-SEARCH_ENDPOINT = "https://html.duckduckgo.com/html/"
+BING_RSS_ENDPOINT = "https://www.bing.com/search?format=rss"
+BING_HTML_ENDPOINT = "https://www.bing.com/search"
 USER_AGENT = (
 	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
 	"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
@@ -93,38 +95,80 @@ def _fetch_text(url: str, method: str = "GET", data: bytes | None = None):
 			"Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
 		},
 	)
-	with request.urlopen(req, timeout=20) as response:
-		encoding = response.headers.get_content_charset() or "utf-8"
-		return response.read().decode(encoding, errors="ignore")
+	try:
+		with request.urlopen(req, timeout=20) as response:
+			encoding = response.headers.get_content_charset() or "utf-8"
+			return response.read().decode(encoding, errors="ignore")
+	except error.HTTPError as exc:
+		detail = exc.read().decode("utf-8", errors="ignore")[:300]
+		raise RuntimeError(f"HTTP {exc.code} for {url}: {detail}") from exc
+	except error.URLError as exc:
+		raise RuntimeError(f"Network request failed for {url}: {exc}") from exc
 
 
 def _extract_result_links(search_html: str, max_results: int):
-	matches = re.findall(
-		r'<a[^>]+class="[^\"]*result__a[^\"]*"[^>]+href="([^\"]+)"[^>]*>(.*?)</a>',
-		search_html,
-		flags=re.IGNORECASE | re.DOTALL,
-	)
+	patterns = [
+		r'<li[^>]+class="[^"]*b_algo[^"]*".*?<h2><a[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
+		r'<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
+	]
 
 	results = []
 	seen_urls = set()
-	for href, title_html in matches:
-		title = _normalize_whitespace(re.sub(r"<[^>]+>", " ", unescape(title_html)))
-		url = unescape(href)
+	for pattern in patterns:
+		matches = re.findall(pattern, search_html, flags=re.IGNORECASE | re.DOTALL)
+		for href, title_html in matches:
+			title = _normalize_whitespace(re.sub(r"<[^>]+>", " ", unescape(title_html)))
+			url = unescape(href)
+			if not url or url in seen_urls:
+				continue
+			seen_urls.add(url)
+			results.append({"title": title or url, "url": url, "snippet": ""})
+			if len(results) >= max_results:
+				return results
+	return results
+
+
+def _extract_bing_rss_links(search_xml: str, max_results: int):
+	try:
+		root = ET.fromstring(search_xml)
+	except ET.ParseError as exc:
+		raise RuntimeError(f"Failed to parse Bing RSS response: {exc}") from exc
+
+	results = []
+	seen_urls = set()
+	for item in root.findall("./channel/item"):
+		title = _normalize_whitespace(item.findtext("title") or "")
+		url = _normalize_whitespace(item.findtext("link") or "")
+		snippet = _normalize_whitespace(item.findtext("description") or "")
 		if not url or url in seen_urls:
 			continue
 		seen_urls.add(url)
-		results.append({"title": title or url, "url": url})
+		results.append({"title": title or url, "url": url, "snippet": snippet})
 		if len(results) >= max_results:
 			break
 	return results
 
 
 def _search_web(query: str, max_results: int):
-	payload = parse.urlencode({"q": query}).encode("utf-8")
-	search_html = _fetch_text(SEARCH_ENDPOINT, method="POST", data=payload)
+	rss_url = f"{BING_RSS_ENDPOINT}&{parse.urlencode({'q': query})}"
+	try:
+		search_xml = _fetch_text(rss_url)
+		results = _extract_bing_rss_links(search_xml, max_results=max_results)
+		if results:
+			return results
+	except Exception as exc:
+		rss_error = str(exc)
+	else:
+		rss_error = "Bing RSS returned no results."
+
+	html_url = f"{BING_HTML_ENDPOINT}?{parse.urlencode({'q': query})}"
+	search_html = _fetch_text(html_url)
 	results = _extract_result_links(search_html, max_results=max_results)
 	if not results:
-		raise RuntimeError("No search results found from the web search endpoint.")
+		raise RuntimeError(
+			"No search results found from the web search endpoint. "
+			f"RSS attempt: {rss_error}"
+		)
 	return results
 
 
@@ -205,11 +249,35 @@ def register(agent):
 			try:
 				page = _extract_page_content(result["url"])
 			except Exception as exc:
+				fallback_content = (result.get("snippet") or "").strip()
+				if fallback_content:
+					collected_pages.append(
+						{
+							"title": result["title"],
+							"url": result["url"],
+							"content": fallback_content,
+						}
+					)
+					errors.append(f"- {result['url']}: page fetch failed, used search snippet instead ({exc})")
+					continue
+
 				errors.append(f"- {result['url']}: {exc}")
 				continue
 
 			content = page.get("content", "").strip()
 			if not content:
+				fallback_content = (result.get("snippet") or "").strip()
+				if fallback_content:
+					collected_pages.append(
+						{
+							"title": page.get("title") or result["title"],
+							"url": result["url"],
+							"content": fallback_content,
+						}
+					)
+					errors.append(f"- {result['url']}: empty page content, used search snippet instead")
+					continue
+
 				errors.append(f"- {result['url']}: empty content")
 				continue
 

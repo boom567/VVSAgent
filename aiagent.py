@@ -88,6 +88,9 @@ class ProviderAdapter:
     def get_endpoint(self):
         raise NotImplementedError
 
+    def is_model_available(self, model: str):
+        return bool((model or "").strip())
+
     def chat_completion(self, model: str, messages, format=None):
         raise NotImplementedError
 
@@ -111,6 +114,17 @@ class OllamaProviderAdapter(ProviderAdapter):
 
     def get_endpoint(self):
         return self.host
+
+    def is_model_available(self, model: str):
+        candidate = (model or "").strip()
+        if not candidate or not self.client:
+            return False
+
+        try:
+            self.client.show(candidate)
+            return True
+        except Exception:
+            return False
 
     def chat_completion(self, model: str, messages, format=None):
         if not self.client:
@@ -251,6 +265,7 @@ class ModularAgent:
         self.provider_adapters = self._build_provider_adapters()
         self.provider_aliases = self._build_provider_aliases()
         self.provider = self._normalize_provider_name(provider) or "ollama"
+        self.model_availability_cache = {}
         self.client = self
         self.registry = SkillRegistry()
         self.history = []
@@ -329,6 +344,9 @@ class ModularAgent:
             raise RuntimeError(f"Unsupported provider: {self.provider}")
         return adapter
 
+    def _clear_model_availability_cache(self):
+        self.model_availability_cache = {}
+
     def _normalize_provider_name(self, provider_name: str):
         normalized = (provider_name or "").strip().lower()
         return self.provider_aliases.get(normalized)
@@ -338,6 +356,7 @@ class ModularAgent:
         if not normalized:
             return f"Unsupported provider. Use: {self._supported_provider_names()}"
         self.provider = normalized
+        self._clear_model_availability_cache()
         return f"LLM provider switched to: {self.provider}"
 
     def _set_api_key(self, key: str, provider_name: str = ""):
@@ -353,7 +372,9 @@ class ModularAgent:
 
     def _set_base_url(self, base_url: str):
         adapter = self._get_active_provider_adapter()
-        return adapter.set_base_url(base_url)
+        result = adapter.set_base_url(base_url)
+        self._clear_model_availability_cache()
+        return result
 
     def _get_provider_status(self):
         adapter = self._get_active_provider_adapter()
@@ -403,7 +424,9 @@ class ModularAgent:
             )
 
         lines = [f"Current active user: {profile.get('user_name', self.current_user)}"]
-        lines.append(f"Preferred model: {profile.get('model_name') or self.model_name}")
+        lines.append(f"Launch model: {self.model_name or '(not set)'}")
+        lines.append(f"Profile fallback model: {self._get_profile_model_name() or '(not set)'}")
+        lines.append(f"Active model: {self._get_active_model_name()}")
 
         preferences = profile.get("preferences", {})
         lines.append("Preferences:")
@@ -426,13 +449,42 @@ class ModularAgent:
 
         return "\n".join(lines)
 
-    def _get_active_model_name(self):
+    def _get_profile_model_name(self):
         profile = self._get_current_user_profile_data(conclusions_limit=0)
-        if profile:
-            preferred_model = (profile.get("model_name") or "").strip()
-            if preferred_model:
-                return preferred_model
-        return self.model_name
+        if not profile:
+            return ""
+        return (profile.get("model_name") or "").strip()
+
+    def _is_model_available(self, model_name: str):
+        candidate = (model_name or "").strip()
+        if not candidate:
+            return False
+
+        adapter = self._get_active_provider_adapter()
+        cache_key = (self.provider, adapter.get_endpoint(), candidate)
+        cached = self.model_availability_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            is_available = adapter.is_model_available(candidate)
+        except Exception as exc:
+            print(f"[Model] Failed to validate model '{candidate}': {exc}")
+            is_available = False
+
+        self.model_availability_cache[cache_key] = is_available
+        return is_available
+
+    def _get_active_model_name(self):
+        explicit_model = (self.model_name or "").strip()
+        if explicit_model and self._is_model_available(explicit_model):
+            return explicit_model
+
+        profile_model = self._get_profile_model_name()
+        if profile_model and self._is_model_available(profile_model):
+            return profile_model
+
+        return explicit_model or profile_model or "llama3"
 
     def _get_voice_skill_options(self):
         profile = self._get_current_user_profile_data(conclusions_limit=0)
@@ -510,7 +562,7 @@ class ModularAgent:
             return "Usage: /voice-config language=zh-CN voice=Tingting rate=210"
 
         preference_text = ";".join(f"{key}={value}" for key, value in normalized_preferences.items())
-        update_profile_tool["func"](self.current_user, self._get_active_model_name(), preference_text)
+        update_profile_tool["func"](self.current_user, "", preference_text)
         options = self._get_voice_skill_options()
         return (
             f"Updated voice config for {self.current_user}: "
