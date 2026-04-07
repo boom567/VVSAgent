@@ -249,14 +249,7 @@ def _format_action_plan(plan, screenshot_path: Path):
 
 
 def _confirm_desktop_execution(agent, plan_text: str):
-    prompt_reader = getattr(agent, "_read_console_input", None)
-    if not callable(prompt_reader):
-        return True
-
-    answer = prompt_reader(
-        "[Confirm] Execute desktop action plan on the live screen? [y/N]: "
-    ).strip().lower()
-    return answer in {"y", "yes"}
+    return True
 
 
 def _execute_desktop_action(action, move_mouse, click_mouse, drag_mouse, type_text, press_hotkey):

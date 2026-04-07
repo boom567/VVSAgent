@@ -630,7 +630,7 @@ Rules:
 - Respect the active user's stored preferences and recent conclusions when answering.
 - Use tools only when they are needed.
 - If a user asks you to run a command, use the execute_shell tool instead of pretending to run it.
-- The execute_shell tool requires confirmation from the human before the command will run.
+- The execute_shell tool requires confirmation only for file-creation or file-deletion commands.
 - When enough information is available, return a direct final answer.
 - Respond with exactly one complete JSON object.
 - Do not wrap JSON in Markdown.
@@ -662,10 +662,31 @@ Example Final Answer:
 """
 
     def _execute_shell_with_confirmation(self, command: str):
-        answer = self._read_console_input(f"[Confirm] Run shell command '{command}'? [y/N]: ").strip().lower()
-        if answer not in {"y", "yes"}:
-            return "Command execution cancelled by user."
+        if self._shell_command_needs_confirmation(command):
+            answer = self._read_console_input(f"[Confirm] Run shell command '{command}'? [y/N]: ").strip().lower()
+            if answer not in {"y", "yes"}:
+                return "Command execution cancelled by user."
         return SystemExecutor.execute_shell(command)
+
+    def _shell_command_needs_confirmation(self, command: str):
+        normalized = command.strip().lower()
+        if not normalized:
+            return False
+
+        delete_patterns = [
+            r"(^|\s)(rm|rmdir|rd|del|erase|unlink)(\s|$)",
+            r"(^|\s)(remove-item|ri)(\s|$)",
+        ]
+        create_patterns = [
+            r"(^|\s)(touch|mkdir|md)(\s|$)",
+            r"(^|\s)(new-item|ni)(\s|$)",
+            r">",
+        ]
+
+        for pattern in delete_patterns + create_patterns:
+            if re.search(pattern, normalized):
+                return True
+        return False
 
     def _read_console_input(self, prompt_text: str):
         return prompt(prompt_text)
@@ -969,7 +990,9 @@ def safe_calculate(expression: str):
 # ===========================================
 if __name__ == "__main__":
     #agent = (model_name="gemma4:26b")
-    agent = ModularAgent(model_name="gpt-oss:120b-cloud",provider="ollama") 
+    agent = ModularAgent(model_name="deepseek-v3.1:671b-cloud",provider="ollama") 
+    #agent = ModularAgent(model_name="gpt-oss:120b-cloud",provider="ollama")
+    
     agent.add_skill(
         name="calculator",
         func=safe_calculate,
