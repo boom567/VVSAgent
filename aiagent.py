@@ -257,7 +257,7 @@ class ModularAgent:
         self.max_iterations = 16
         self.current_user = "default"
         self.auto_memory_enabled = True
-        
+        print("model:", model_name)
         # 默认注册系统命令工具
         self.registry.register(
             name="execute_shell",
