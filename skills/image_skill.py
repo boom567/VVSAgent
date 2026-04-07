@@ -28,8 +28,13 @@ def _resolve_image_path(image_path: str | None):
 def register(agent):
     def analyze_image(image_path: str = "", prompt_text: str = "Describe this image in detail."):
         target = _resolve_image_path(image_path or None)
-        response = agent.client.chat(
-            model=agent.model_name,
+        model_name = agent.model_name
+        get_active_model = getattr(agent, "_get_active_model_name", None)
+        if callable(get_active_model):
+            model_name = get_active_model()
+
+        response = agent.chat_completion(
+            model=model_name,
             messages=[
                 {
                     "role": "user",

@@ -1,6 +1,8 @@
 import subprocess
 import threading
 import time
+import platform
+import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum, auto
@@ -14,6 +16,15 @@ import speech_recognition as sr
 
 
 VOICE_DIR = Path(__file__).resolve().parent.parent / "voice_tmp"
+SYSTEM_NAME = platform.system().lower()
+
+
+def _is_macos():
+    return SYSTEM_NAME == "darwin"
+
+
+def _is_windows():
+    return SYSTEM_NAME == "windows"
 VOICE_EXIT_PHRASES = {
     "退出对话",
     "退出语音对话",
@@ -217,7 +228,7 @@ class MicrophoneListeningSession:
             self._transition(ListeningPhase.ERROR)
             return VoiceTurnResult(
                 message=(
-                    "Microphone recording failed. Check macOS microphone permissions and audio device availability. "
+                    "Microphone recording failed. Check system microphone permissions and audio device availability. "
                     f"Details: {exc}"
                 )
             )
@@ -424,16 +435,55 @@ def speak_text(text: str, voice: str = "", rate: int = 180):
     if not text.strip():
         return "No text to speak."
 
-    command = ["say", "-r", str(rate)]
-    if voice:
-        command.extend(["-v", voice])
-    command.append(text)
+    if _is_macos():
+        command = ["say", "-r", str(rate)]
+        if voice:
+            command.extend(["-v", voice])
+        command.append(text)
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "say failed")
+        return f"Spoken successfully: {text[:80]}"
 
-    result = subprocess.run(command, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "say failed")
+    if _is_windows():
+        sapi_rate = max(-10, min(10, int((int(rate) - 180) / 20)))
+        escaped_text = text.replace("'", "''")
+        script_lines = [
+            "Add-Type -AssemblyName System.Speech",
+            "$speak = New-Object System.Speech.Synthesis.SpeechSynthesizer",
+            f"$speak.Rate = {sapi_rate}",
+        ]
+        if voice:
+            escaped_voice = voice.replace("'", "''")
+            script_lines.append(f"$speak.SelectVoice('{escaped_voice}')")
+        script_lines.append(f"$speak.Speak('{escaped_text}')")
+        script = "; ".join(script_lines)
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "Windows speech synthesis failed")
+        return f"Spoken successfully: {text[:80]}"
 
-    return f"Spoken successfully: {text[:80]}"
+    if shutil.which("espeak"):
+        command = ["espeak", "-s", str(rate), text]
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "espeak failed")
+        return f"Spoken successfully: {text[:80]}"
+
+    if shutil.which("spd-say"):
+        result = subprocess.run(["spd-say", text], capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "spd-say failed")
+        return f"Spoken successfully: {text[:80]}"
+
+    raise RuntimeError(
+        "No supported TTS backend found for this platform. "
+        "Use macOS say, Windows PowerShell SAPI, or install espeak/spd-say on Linux."
+    )
 
 
 def transcribe_audio_file(file_path: str, language: str = "zh-CN"):
@@ -481,7 +531,7 @@ def register(agent):
     agent.add_skill(
         name="speak_text",
         func=speak_text,
-        description="Speak text aloud using macOS say.",
+        description="Speak text aloud using an OS-appropriate local TTS backend.",
         parameters={
             "text": "string",
             "voice": "string",

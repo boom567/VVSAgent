@@ -2,13 +2,22 @@ import subprocess
 import json
 import ast
 import operator
+import importlib
 import importlib.util
 import re
+import os
+import base64
+import mimetypes
+from urllib import request, error
 from pathlib import Path
 
-import ollama
+ollama = importlib.import_module("ollama") if importlib.util.find_spec("ollama") else None
 
-from prompt_toolkit import prompt
+if importlib.util.find_spec("prompt_toolkit"):
+    prompt = importlib.import_module("prompt_toolkit").prompt
+else:
+    def prompt(prompt_text):
+        return input(prompt_text)
 
 # ===========================================
 # 1. 技能注册中心 (Skill Registry)
@@ -58,13 +67,191 @@ class SystemExecutor:
         except Exception as e:
             return f"System Error: {str(e)}"
 
+
+class ProviderAdapter:
+    def __init__(self, name: str, aliases=None):
+        self.name = name
+        self.aliases = set(aliases or []) | {name}
+
+    def supports_api_key(self):
+        return False
+
+    def set_api_key(self, key: str):
+        return "Current provider does not require an API key."
+
+    def get_api_key_state(self):
+        return "n/a"
+
+    def set_base_url(self, base_url: str):
+        raise NotImplementedError
+
+    def get_endpoint(self):
+        raise NotImplementedError
+
+    def chat_completion(self, model: str, messages, format=None):
+        raise NotImplementedError
+
+
+class OllamaProviderAdapter(ProviderAdapter):
+    def __init__(self, host: str):
+        super().__init__("ollama", aliases={"local"})
+        self.host = host
+        self.client = ollama.Client(host=self.host, trust_env=False) if ollama else None
+
+    def set_base_url(self, base_url: str):
+        value = base_url.strip().rstrip("/")
+        if not value.startswith("http://") and not value.startswith("https://"):
+            return "Base URL must start with http:// or https://"
+        if not ollama:
+            return "Ollama package is not installed. Install 'ollama' or switch provider."
+
+        self.host = value
+        self.client = ollama.Client(host=self.host, trust_env=False)
+        return f"Ollama host set to: {self.host}"
+
+    def get_endpoint(self):
+        return self.host
+
+    def chat_completion(self, model: str, messages, format=None):
+        if not self.client:
+            raise RuntimeError("Ollama provider requires the 'ollama' Python package. Install it or switch provider.")
+        return self.client.chat(model=model, messages=messages, format=format)
+
+
+class OpenAICompatibleProviderAdapter(ProviderAdapter):
+    def __init__(self, name: str, aliases, base_url: str, env_var_name: str):
+        super().__init__(name, aliases=aliases)
+        self.base_url = base_url.rstrip("/")
+        self.env_var_name = env_var_name
+        self.api_key = (os.getenv(env_var_name) or "").strip()
+
+    def supports_api_key(self):
+        return True
+
+    def set_api_key(self, key: str):
+        normalized_key = key.strip()
+        self.api_key = normalized_key
+        if not normalized_key:
+            return f"Cleared API key for provider: {self.name}"
+        return f"API key saved for provider: {self.name}"
+
+    def get_api_key_state(self):
+        return "set" if self.api_key else "not set"
+
+    def set_base_url(self, base_url: str):
+        value = base_url.strip().rstrip("/")
+        if not value.startswith("http://") and not value.startswith("https://"):
+            return "Base URL must start with http:// or https://"
+        self.base_url = value
+        return f"{self.name} base URL set to: {self.base_url}"
+
+    def get_endpoint(self):
+        return self.base_url
+
+    def _image_path_to_data_url(self, image_path: str):
+        target = Path(image_path).expanduser()
+        if not target.exists() or not target.is_file():
+            raise FileNotFoundError(f"Image does not exist: {target}")
+
+        content = target.read_bytes()
+        encoded = base64.b64encode(content).decode("ascii")
+        mime_type, _ = mimetypes.guess_type(str(target))
+        if not mime_type:
+            mime_type = "application/octet-stream"
+        return f"data:{mime_type};base64,{encoded}"
+
+    def _to_openai_messages(self, messages):
+        converted = []
+        for message in messages:
+            role = message.get("role", "user")
+            content = message.get("content", "")
+            images = message.get("images") or []
+
+            if not images:
+                converted.append({"role": role, "content": content})
+                continue
+
+            parts = []
+            if content:
+                parts.append({"type": "text", "text": str(content)})
+
+            for image in images:
+                parts.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": self._image_path_to_data_url(str(image))},
+                    }
+                )
+
+            converted.append({"role": role, "content": parts})
+
+        return converted
+
+    def _extract_openai_content(self, payload):
+        choices = payload.get("choices", [])
+        if not choices:
+            return ""
+
+        message = choices[0].get("message", {})
+        content = message.get("content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            chunks = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    chunks.append(str(item.get("text", "")))
+            return "\n".join(part for part in chunks if part)
+        return str(content)
+
+    def chat_completion(self, model: str, messages, format=None):
+        if not self.api_key:
+            raise RuntimeError(
+                f"No API key configured for provider '{self.name}'. "
+                f"Use /apikey <key> or set env var {self.env_var_name}."
+            )
+
+        request_body = {
+            "model": model,
+            "messages": self._to_openai_messages(messages),
+        }
+        if format == "json":
+            request_body["response_format"] = {"type": "json_object"}
+
+        body = json.dumps(request_body).encode("utf-8")
+        endpoint = f"{self.base_url}/chat/completions"
+        req = request.Request(
+            endpoint,
+            method="POST",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            },
+        )
+
+        try:
+            with request.urlopen(req, timeout=120) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="ignore")
+            raise RuntimeError(f"HTTP {exc.code} from {self.name}: {detail}") from exc
+        except error.URLError as exc:
+            raise RuntimeError(f"Failed to connect to {self.name}: {exc}") from exc
+
+        content = self._extract_openai_content(payload)
+        return {"message": {"content": content}}
+
 # ===========================================
 # 3. 核心 Agent (Modular Agent)
 # ===========================================
 class ModularAgent:
-    def __init__(self, model_name="llama3"):
+    def __init__(self, model_name="llama3", provider="ollama"):
         self.model_name = model_name
-        self.client = ollama.Client(host="http://127.0.0.1:11434", trust_env=False)
+        self.provider_adapters = self._build_provider_adapters()
+        self.provider_aliases = self._build_provider_aliases()
+        self.provider = self._normalize_provider_name(provider) or "ollama"
+        self.client = self
         self.registry = SkillRegistry()
         self.history = []
         self.max_iterations = 16
@@ -106,6 +293,88 @@ class ModularAgent:
                     print(f"[Skill Loader] Missing register(agent) in {skill_file.name}")
             except Exception as exc:
                 print(f"[Skill Loader] Failed to load {skill_file.name}: {exc}")
+
+    def _build_provider_adapters(self):
+        adapters = {
+            "ollama": OllamaProviderAdapter(host="http://127.0.0.1:11434"),
+            "deepseek": OpenAICompatibleProviderAdapter(
+                name="deepseek",
+                aliases={"deepseek-official"},
+                base_url="https://api.deepseek.com",
+                env_var_name="DEEPSEEK_API_KEY",
+            ),
+            "openai": OpenAICompatibleProviderAdapter(
+                name="openai",
+                aliases={"openai-compatible", "compatible"},
+                base_url="https://api.openai.com/v1",
+                env_var_name="OPENAI_API_KEY",
+            ),
+        }
+        return adapters
+
+    def _build_provider_aliases(self):
+        aliases = {}
+        for provider_name, adapter in self.provider_adapters.items():
+            aliases[provider_name] = provider_name
+            for alias in adapter.aliases:
+                aliases[alias] = provider_name
+        return aliases
+
+    def _supported_provider_names(self):
+        return ", ".join(sorted(self.provider_adapters.keys()))
+
+    def _get_active_provider_adapter(self):
+        adapter = self.provider_adapters.get(self.provider)
+        if not adapter:
+            raise RuntimeError(f"Unsupported provider: {self.provider}")
+        return adapter
+
+    def _normalize_provider_name(self, provider_name: str):
+        normalized = (provider_name or "").strip().lower()
+        return self.provider_aliases.get(normalized)
+
+    def _set_provider(self, provider_name: str):
+        normalized = self._normalize_provider_name(provider_name)
+        if not normalized:
+            return f"Unsupported provider. Use: {self._supported_provider_names()}"
+        self.provider = normalized
+        return f"LLM provider switched to: {self.provider}"
+
+    def _set_api_key(self, key: str, provider_name: str = ""):
+        target_provider = self.provider
+        if provider_name.strip():
+            normalized = self._normalize_provider_name(provider_name)
+            if not normalized:
+                return f"Unsupported provider for key. Use: {self._supported_provider_names()}"
+            target_provider = normalized
+
+        adapter = self.provider_adapters[target_provider]
+        return adapter.set_api_key(key)
+
+    def _set_base_url(self, base_url: str):
+        adapter = self._get_active_provider_adapter()
+        return adapter.set_base_url(base_url)
+
+    def _get_provider_status(self):
+        adapter = self._get_active_provider_adapter()
+        key_state = adapter.get_api_key_state()
+        model_name = self._get_active_model_name()
+        endpoint = adapter.get_endpoint()
+
+        return (
+            f"Provider: {self.provider}\n"
+            f"Model: {model_name}\n"
+            f"Endpoint: {endpoint}\n"
+            f"API key: {key_state}"
+        )
+
+    def chat_completion(self, model: str, messages, format=None):
+        adapter = self._get_active_provider_adapter()
+        return adapter.chat_completion(model=model, messages=messages, format=format)
+
+    def chat(self, model: str, messages, format=None):
+        # Compatibility layer for skills that call agent.client.chat(...)
+        return self.chat_completion(model=model, messages=messages, format=format)
 
     def _get_current_user_profile_data(self, conclusions_limit=5):
         profile_tool = self.registry.skills.get("get_user_profile_data")
@@ -303,7 +572,7 @@ Assistant answer:
             return
 
         try:
-            response = self.client.chat(
+            response = self.chat_completion(
                 model=self._get_active_model_name(),
                 messages=[
                     {"role": "system", "content": self._build_memory_decision_prompt(user_input, assistant_answer)}
@@ -350,6 +619,7 @@ Assistant answer:
 
 Current conversation context:
 - Active user: {self.current_user}
+- Active provider: {self.provider}
 - Active model: {active_model_name}
 
 User profile context from the local XML knowledge base:
@@ -455,7 +725,7 @@ Example Final Answer:
             
             # 1. 调用 LLM
             try:
-                response = self.client.chat(
+                response = self.chat_completion(
                     model=self._get_active_model_name(),
                     messages=[{"role": "system", "content": self._get_system_prompt()}] + self.history,
                     format="json"
@@ -518,7 +788,7 @@ Example Final Answer:
     def chat_loop(self):
         print("AI Agent console started.")
         print(f"Current user: {self.current_user}")
-        print("Commands: /help, /reset, /voice, /voice-config, /user <name>, /whoami, /autosave, /exit")
+        print("Commands: /help, /reset, /voice, /voice-config, /provider, /apikey, /endpoint, /user <name>, /whoami, /autosave, /exit")
 
         while True:
             try:
@@ -539,12 +809,17 @@ Example Final Answer:
                 print("/reset Clear conversation history")
                 print("/voice Enter continuous voice conversation mode")
                 print("/voice-config Show or update voice settings for the current user")
+                print(f"/provider Show or switch LLM provider: {self._supported_provider_names()}")
+                print("/apikey Configure API key: /apikey <key> or /apikey <provider> <key>")
+                print("/endpoint Configure provider endpoint/host URL")
                 print("/user <name> Switch the active user profile")
                 print("/whoami Show the active user profile context")
                 print("/autosave Show or toggle automatic knowledge-base saving")
                 print("/exit  Exit the console")
                 print("In voice mode, say 退出对话 to exit the voice conversation.")
                 print("Example: /voice-config language=zh-CN voice=Tingting rate=210")
+                print("Example: /provider deepseek")
+                print("Example: /apikey sk-xxxx")
                 print("Ask normal questions directly. If a command is needed, the agent will ask for confirmation.")
                 continue
 
@@ -574,8 +849,42 @@ Example Final Answer:
                 print(f"Agent> Switched active user to: {self.current_user}")
                 continue
 
+            if user_input.startswith("/provider"):
+                parts = user_input.split()
+                if len(parts) == 1:
+                    print(self._get_provider_status())
+                    continue
+
+                result = self._set_provider(parts[1])
+                print(f"Agent> {result}")
+                print(self._get_provider_status())
+                continue
+
+            if user_input.startswith("/apikey"):
+                parts = user_input.split()
+                if len(parts) == 1:
+                    print("Agent> Usage: /apikey <key> OR /apikey <provider> <key>")
+                    continue
+
+                if len(parts) == 2:
+                    result = self._set_api_key(parts[1])
+                else:
+                    result = self._set_api_key(parts[2], provider_name=parts[1])
+                print(f"Agent> {result}")
+                continue
+
+            if user_input.startswith("/endpoint"):
+                parts = user_input.split(maxsplit=1)
+                if len(parts) == 1:
+                    print("Agent> Usage: /endpoint <url>")
+                    continue
+                result = self._set_base_url(parts[1])
+                print(f"Agent> {result}")
+                continue
+
             if user_input == "/whoami":
                 print(self._format_current_user_context())
+                print(self._get_provider_status())
                 print(f"Active model: {self._get_active_model_name()}")
                 print(f"Auto memory save: {'on' if self.auto_memory_enabled else 'off'}")
                 continue
@@ -659,7 +968,8 @@ def safe_calculate(expression: str):
 # 4. 测试与扩展演示
 # ===========================================
 if __name__ == "__main__":
-    agent = ModularAgent(model_name="gemma4:26b")
+    #agent = (model_name="gemma4:26b")
+    agent = ModularAgent(model_name="gpt-oss:120b-cloud",provider="ollama") 
     agent.add_skill(
         name="calculator",
         func=safe_calculate,

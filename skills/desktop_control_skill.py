@@ -3,9 +3,15 @@ from datetime import datetime
 import json
 from pathlib import Path
 import time
+import platform
 
 
 DESKTOP_TMP_DIR = Path(__file__).resolve().parent.parent / "desktop_tmp"
+SYSTEM_NAME = platform.system().lower()
+
+
+def _is_macos():
+    return SYSTEM_NAME == "darwin"
 
 
 def _desktop_file_path(output_path: str | None = None, prefix: str = "screen", suffix: str = ".png"):
@@ -33,6 +39,9 @@ def _require_pyautogui():
 
 
 def _run_osascript(script: str, language: str = "AppleScript"):
+    if not _is_macos():
+        raise RuntimeError(f"osascript is only available on macOS. Current platform: {platform.system()}")
+
     command = ["/usr/bin/osascript"]
     if language != "AppleScript":
         command.extend(["-l", language])
@@ -160,6 +169,18 @@ def _press_hotkey_with_osascript(keys: str):
 
 
 def _capture_screen_to_path(target: Path):
+    try:
+        pyautogui = _require_pyautogui()
+        screenshot = pyautogui.screenshot()
+        screenshot.save(str(target))
+        return target
+    except Exception as exc:
+        if not _is_macos():
+            raise RuntimeError(
+                "Screen capture on this platform requires pyautogui (and Pillow). "
+                f"Current platform: {platform.system()}. Details: {exc}"
+            ) from exc
+
     result = subprocess.run(["/usr/sbin/screencapture", "-x", str(target)], capture_output=True, text=True)
     if result.returncode != 0:
         details = result.stderr.strip() or result.stdout.strip() or "screencapture failed"
@@ -304,7 +325,7 @@ def register(agent):
         if callable(get_active_model):
             model_name = get_active_model()
 
-        response = agent.client.chat(
+        response = agent.chat_completion(
             model=model_name,
             messages=[
                 {
@@ -342,7 +363,7 @@ def register(agent):
         if callable(get_active_model):
             model_name = get_active_model()
 
-        prompt_text = f"""You are planning desktop UI actions on macOS based on a screenshot.
+        prompt_text = f"""You are planning desktop UI actions on {platform.system()} based on a screenshot.
 
 User goal:
 {goal}
@@ -375,7 +396,7 @@ Rules:
 - Do not include any markdown.
 """
 
-        response = agent.client.chat(
+        response = agent.chat_completion(
             model=model_name,
             messages=[
                 {
@@ -420,7 +441,11 @@ Rules:
             pyautogui = _require_pyautogui()
             position = pyautogui.position()
             return f"Mouse position: x={position.x}, y={position.y}"
-        except RuntimeError:
+        except RuntimeError as exc:
+            if not _is_macos():
+                raise RuntimeError(
+                    f"Mouse position requires pyautogui on {platform.system()}."
+                ) from exc
             x, y = _get_mouse_position_with_osascript()
             return f"Mouse position: x={x}, y={y}"
 
@@ -428,7 +453,9 @@ Rules:
         try:
             pyautogui = _require_pyautogui()
             pyautogui.moveTo(int(x), int(y), duration=float(duration_seconds))
-        except RuntimeError:
+        except RuntimeError as exc:
+            if not _is_macos():
+                raise RuntimeError(f"move_mouse requires pyautogui on {platform.system()}.") from exc
             _move_mouse_with_osascript(int(x), int(y))
         return f"Moved mouse to x={int(x)}, y={int(y)}"
 
@@ -448,7 +475,9 @@ Rules:
                 interval=float(interval_seconds),
                 button=button,
             )
-        except RuntimeError:
+        except RuntimeError as exc:
+            if not _is_macos():
+                raise RuntimeError(f"click_mouse requires pyautogui on {platform.system()}.") from exc
             _click_mouse_with_osascript(int(x), int(y), button, max(1, int(clicks)))
         return f"Clicked mouse at x={int(x)}, y={int(y)}, button={button}, clicks={max(1, int(clicks))}"
 
@@ -459,7 +488,9 @@ Rules:
         try:
             pyautogui = _require_pyautogui()
             pyautogui.dragTo(int(x), int(y), duration=float(duration_seconds), button=button)
-        except RuntimeError:
+        except RuntimeError as exc:
+            if not _is_macos():
+                raise RuntimeError(f"drag_mouse requires pyautogui on {platform.system()}.") from exc
             _drag_mouse_with_osascript(int(x), int(y))
         return f"Dragged mouse to x={int(x)}, y={int(y)}, button={button}"
 
@@ -467,7 +498,9 @@ Rules:
         try:
             pyautogui = _require_pyautogui()
             pyautogui.write(text, interval=float(interval_seconds))
-        except RuntimeError:
+        except RuntimeError as exc:
+            if not _is_macos():
+                raise RuntimeError(f"type_text requires pyautogui on {platform.system()}.") from exc
             _type_text_with_osascript(text)
         return f"Typed text ({len(text)} chars)."
 
@@ -479,14 +512,16 @@ Rules:
         try:
             pyautogui = _require_pyautogui()
             pyautogui.hotkey(*normalized)
-        except RuntimeError:
+        except RuntimeError as exc:
+            if not _is_macos():
+                raise RuntimeError(f"press_hotkey requires pyautogui on {platform.system()}.") from exc
             _press_hotkey_with_osascript(keys)
         return f"Pressed hotkey: {', '.join(normalized)}"
 
     agent.add_skill(
         name="capture_screen",
         func=capture_screen,
-        description="Capture the current macOS screen to a PNG file.",
+        description="Capture the current system screen to a PNG file.",
         parameters={
             "output_path": "string",
         },
