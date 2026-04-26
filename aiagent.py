@@ -68,6 +68,14 @@ class SystemExecutor:
             return f"System Error: {str(e)}"
 
 
+class ToolApprovalPending(Exception):
+    def __init__(self, tool_name: str, parameters: dict, prompt_text: str):
+        super().__init__(prompt_text)
+        self.tool_name = tool_name
+        self.parameters = parameters
+        self.prompt_text = prompt_text
+
+
 class ProviderAdapter:
     def __init__(self, name: str, aliases=None):
         self.name = name
@@ -317,6 +325,10 @@ class ModularAgent:
         self.max_iterations = 16
         self.current_user = "default"
         self.auto_memory_enabled = True
+        self.last_thought = ""
+        self.last_action = None
+        self.tool_approval_handler = None
+        self.pending_tool_call = None
         print("model:", model_name)
         # 默认注册系统命令工具
         self.registry.register(
@@ -789,6 +801,170 @@ Example Final Answer:
     def _read_console_input(self, prompt_text: str):
         return prompt(prompt_text)
 
+    def _tool_action_needs_confirmation(self, tool_name: str, params):
+        normalized_tool = str(tool_name or "").strip().lower()
+        if not normalized_tool:
+            return False
+
+        params = params if isinstance(params, dict) else {}
+        path_keys = {
+            "file_path",
+            "target_path",
+            "path",
+            "source_path",
+            "destination_path",
+        }
+        has_path_like_param = any(key in params for key in path_keys)
+
+        file_keywords = ("file", "excel", "sheet", "workbook", "path", "code")
+        io_keywords = ("read", "write", "create", "append", "delete", "remove", "save", "update")
+        is_file_related = any(keyword in normalized_tool for keyword in file_keywords)
+        is_read_write_action = any(keyword in normalized_tool for keyword in io_keywords)
+
+        explicit_tools = {
+            "implement_code_task",
+            "create_excel_file",
+            "list_workbook_sheets",
+            "create_sheet",
+            "delete_sheet",
+            "read_excel_range",
+            "write_excel_cells",
+            "append_excel_row",
+            "find_in_excel",
+        }
+
+        return normalized_tool in explicit_tools or (has_path_like_param and is_file_related and is_read_write_action)
+
+    def _request_tool_approval(self, tool_name: str, params, assistant_content: str, iteration_index: int):
+        prompt_text = (
+            f"[Confirm] Allow tool '{tool_name}' to access files? "
+            f"params={json.dumps(params, ensure_ascii=False)}"
+        )
+
+        if callable(self.tool_approval_handler):
+            decision = self.tool_approval_handler(tool_name, params, prompt_text)
+            if decision is None:
+                self.pending_tool_call = {
+                    "tool_name": tool_name,
+                    "params": params,
+                    "assistant_content": assistant_content,
+                    "iteration_index": iteration_index,
+                    "prompt_text": prompt_text,
+                }
+                raise ToolApprovalPending(tool_name, params, prompt_text)
+            return bool(decision)
+
+        answer = self._read_console_input(f"{prompt_text} [y/N]: ").strip().lower()
+        return answer in {"y", "yes"}
+
+    def _execute_action_tool(self, tool_name: str, params):
+        if tool_name not in self.registry.skills:
+            return f"Error: Tool '{tool_name}' not found."
+
+        print(f"[Action]: Calling {tool_name} with {params}")
+        func = self.registry.skills[tool_name]["func"]
+        try:
+            return str(func(**params))
+        except Exception as e:
+            return f"Error executing tool: {str(e)}"
+
+    def _run_iterations(self, initial_iteration: int, original_user_input: str):
+        for i in range(initial_iteration, self.max_iterations):
+            print(f"\n--- Iteration {i+1} ---")
+
+            try:
+                response = self.chat_completion(
+                    model=self._get_active_model_name(),
+                    messages=[{"role": "system", "content": self._get_system_prompt()}] + self.history,
+                    format="json"
+                )
+                content = response['message']['content']
+
+                json_str = self._extract_json(content)
+                if not json_str:
+                    self._request_json_retry(content, "response was not complete valid JSON")
+                    continue
+
+                try:
+                    data = json.loads(json_str)
+                except json.JSONDecodeError as exc:
+                    self._request_json_retry(content, f"JSON decode error: {exc}")
+                    continue
+                if data.get("thought"):
+                    thought = data.get("thought")
+                    print(f"[AI Thought]: {thought}")
+                    self.last_thought = thought
+
+                if "final_answer" in data:
+                    self.history.append({"role": "assistant", "content": content})
+                    self._maybe_store_conversation_conclusion(original_user_input, data["final_answer"])
+                    return data["final_answer"]
+
+                elif "action" in data:
+                    action = data["action"]
+                    tool_name = action["name"]
+                    params = self._normalize_action_parameters(tool_name, action.get("parameters", {}))
+                    self.last_action = {"name": tool_name, "parameters": params}
+
+                    if self._tool_action_needs_confirmation(tool_name, params):
+                        approved = self._request_tool_approval(tool_name, params, content, i)
+                        if not approved:
+                            observation = "Tool execution skipped by user."
+                        else:
+                            observation = self._execute_action_tool(tool_name, params)
+                    else:
+                        observation = self._execute_action_tool(tool_name, params)
+
+                    print(f"[Observation]: {observation[:100]}...")
+                    self.history.append({"role": "assistant", "content": content})
+                    self.history.append({"role": "user", "content": f"Observation: {observation}"})
+
+                else:
+                    raise ValueError("JSON missing both 'action' and 'final_answer'.")
+
+            except ToolApprovalPending:
+                raise
+            except Exception as e:
+                import socket
+                error_msg = f"Error in Agent loop: {str(e)}"
+                print(error_msg)
+                if isinstance(e, (TimeoutError, socket.timeout)) or "timed out" in str(e).lower():
+                    print("[Agent] Request timed out, retrying...")
+                    continue
+                self.history.append({"role": "user", "content": error_msg})
+                break
+
+        return "Agent stopped: Max iterations reached or error occurred."
+
+    def resume_pending_approval(self, approved: bool):
+        pending = self.pending_tool_call
+        if not pending:
+            raise ValueError("No pending tool approval.")
+
+        self.pending_tool_call = None
+        tool_name = pending["tool_name"]
+        params = pending["params"]
+        assistant_content = pending["assistant_content"]
+        iteration_index = int(pending["iteration_index"])
+
+        if approved:
+            observation = self._execute_action_tool(tool_name, params)
+        else:
+            observation = "Tool execution skipped by user."
+
+        print(f"[Observation]: {observation[:100]}...")
+        self.history.append({"role": "assistant", "content": assistant_content})
+        self.history.append({"role": "user", "content": f"Observation: {observation}"})
+
+        original_user_input = ""
+        for message in self.history:
+            if message.get("role") == "user":
+                content = str(message.get("content", ""))
+                if not content.startswith("Observation:") and not content.startswith("Error in Agent loop:"):
+                    original_user_input = content
+                    break
+        return self._run_iterations(iteration_index + 1, original_user_input)
+
     def _canonical_parameter_name(self, name: str):
         return re.sub(r"[^a-z0-9]", "", name.lower())
 
@@ -832,81 +1008,16 @@ Example Final Answer:
         )
 
     def run(self, user_input, reset_history=True):
+        if self.pending_tool_call:
+            return "Pending approval exists. Please allow or skip the current file action first."
+
         if reset_history:
             self.history = []
 
         # 初始用户输入
         self.history.append({"role": "user", "content": user_input})
-        
-        # 最大迭代次数，防止死循环
-        for i in range(self.max_iterations):
-            print(f"\n--- Iteration {i+1} ---")
-            
-            # 1. 调用 LLM
-            try:
-                response = self.chat_completion(
-                    model=self._get_active_model_name(),
-                    messages=[{"role": "system", "content": self._get_system_prompt()}] + self.history,
-                    format="json"
-                )
-                content = response['message']['content']
-                
-                # 2. 解析 JSON (由于 LLM 可能在 JSON 前后加 Markdown 代码块，需要清洗)
-                json_str = self._extract_json(content)
-                if not json_str:
-                    self._request_json_retry(content, "response was not complete valid JSON")
-                    continue
-                
-                try:
-                    data = json.loads(json_str)
-                except json.JSONDecodeError as exc:
-                    self._request_json_retry(content, f"JSON decode error: {exc}")
-                    continue
-                if data.get("thought"):
-                    print(f"[AI Thought]: {data.get('thought')}")
 
-                # 3. 检查是 Action 还是 Final Answer
-                if "final_answer" in data:
-                    #print(f"[Final Answer]: {data['final_answer']}")
-                    self.history.append({"role": "assistant", "content": content})
-                    self._maybe_store_conversation_conclusion(user_input, data["final_answer"])
-                    return data["final_answer"]
-
-                elif "action" in data:
-                    action = data["action"]
-                    tool_name = action["name"]
-                    params = self._normalize_action_parameters(tool_name, action.get("parameters", {}))
-
-                    # 4. 查找并执行技能
-                    if tool_name in self.registry.skills:
-                        print(f"[Action]: Calling {tool_name} with {params}")
-                        func = self.registry.skills[tool_name]["func"]
-                        try:
-                            observation = str(func(**params))
-                        except Exception as e:
-                            observation = f"Error executing tool: {str(e)}"
-                    else:
-                        observation = f"Error: Tool '{tool_name}' not found."
-
-                    # 5. 将观察结果反馈给 AI
-                    print(f"[Observation]: {observation[:100]}...")
-                    self.history.append({"role": "assistant", "content": content})
-                    self.history.append({"role": "user", "content": f"Observation: {observation}"})
-                
-                else:
-                    raise ValueError("JSON missing both 'action' and 'final_answer'.")
-
-            except Exception as e:
-                import socket
-                error_msg = f"Error in Agent loop: {str(e)}"
-                print(error_msg)
-                if isinstance(e, (TimeoutError, socket.timeout)) or "timed out" in str(e).lower():
-                    print("[Agent] Request timed out, retrying...")
-                    continue
-                self.history.append({"role": "user", "content": error_msg})
-                break
-        
-        return "Agent stopped: Max iterations reached or error occurred."
+        return self._run_iterations(0, user_input)
 
     def chat_loop(self):
         print("AI Agent console started.")
