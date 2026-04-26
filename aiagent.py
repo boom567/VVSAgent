@@ -245,13 +245,58 @@ class OpenAICompatibleProviderAdapter(ProviderAdapter):
         )
 
         try:
-            with request.urlopen(req, timeout=120) as response:
+            with request.urlopen(req, timeout=300) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="ignore")
             raise RuntimeError(f"HTTP {exc.code} from {self.name}: {detail}") from exc
         except error.URLError as exc:
             raise RuntimeError(f"Failed to connect to {self.name}: {exc}") from exc
+
+        content = self._extract_openai_content(payload)
+        return {"message": {"content": content}}
+
+
+class MLXProviderAdapter(OpenAICompatibleProviderAdapter):
+    """Adapter for mlx_lm.server (Apple MLX local inference, no API key required)."""
+
+    def __init__(self, base_url: str = "http://127.0.0.1:8000"):
+        super().__init__(
+            name="vmlx",
+            aliases={"mlx", "mlx_lm"},
+            base_url=base_url,
+            env_var_name="MLX_API_KEY",
+        )
+
+    def supports_api_key(self):
+        return False
+
+    def get_api_key_state(self):
+        return "n/a"
+
+    def chat_completion(self, model: str, messages, format=None):
+        request_body = {
+            "model": model,
+            "messages": self._to_openai_messages(messages),
+        }
+        if format == "json":
+            request_body["response_format"] = {"type": "json_object"}
+
+        body = json.dumps(request_body).encode("utf-8")
+        endpoint = f"{self.base_url}/v1/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        req = request.Request(endpoint, method="POST", data=body, headers=headers)
+        try:
+            with request.urlopen(req, timeout=300) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="ignore")
+            raise RuntimeError(f"HTTP {exc.code} from vmlx: {detail}") from exc
+        except error.URLError as exc:
+            raise RuntimeError(f"Failed to connect to vmlx server: {exc}") from exc
 
         content = self._extract_openai_content(payload)
         return {"message": {"content": content}}
@@ -324,6 +369,7 @@ class ModularAgent:
                 base_url="https://api.openai.com/v1",
                 env_var_name="OPENAI_API_KEY",
             ),
+            "vmlx": MLXProviderAdapter(base_url="http://127.0.0.1:8080")
         }
         return adapters
 
@@ -816,8 +862,8 @@ Example Final Answer:
                 except json.JSONDecodeError as exc:
                     self._request_json_retry(content, f"JSON decode error: {exc}")
                     continue
-                #不需要思考过程
-                #print(f"[AI Thought]: {data.get('thought')}")
+                if data.get("thought"):
+                    print(f"[AI Thought]: {data.get('thought')}")
 
                 # 3. 检查是 Action 还是 Final Answer
                 if "final_answer" in data:
@@ -851,8 +897,12 @@ Example Final Answer:
                     raise ValueError("JSON missing both 'action' and 'final_answer'.")
 
             except Exception as e:
+                import socket
                 error_msg = f"Error in Agent loop: {str(e)}"
                 print(error_msg)
+                if isinstance(e, (TimeoutError, socket.timeout)) or "timed out" in str(e).lower():
+                    print("[Agent] Request timed out, retrying...")
+                    continue
                 self.history.append({"role": "user", "content": error_msg})
                 break
         
@@ -861,7 +911,7 @@ Example Final Answer:
     def chat_loop(self):
         print("AI Agent console started.")
         print(f"Current user: {self.current_user}")
-        print("Commands: /help, /reset, /voice, /voice-config, /provider, /apikey, /endpoint, /user <name>, /whoami, /autosave, /exit")
+        print("Commands: /help, /reset, /voice, /voice-config, /proviƒder, /apikey, /endpoint, /user <name>, /whoami, /autosave, /exit")
 
         while True:
             try:
@@ -1042,9 +1092,12 @@ def safe_calculate(expression: str):
 # ===========================================
 if __name__ == "__main__":
     #agent = (model_name="gemma4:26b")
-    agent = ModularAgent(model_name="deepseek-v3.1:671b-cloud",provider="ollama") 
+    #agent = ModularAgent(model_name="deepseek-v3.1:671b-cloud",provider="ollama") 
     #agent = ModularAgent(model_name="gpt-oss:120b-cloud",provider="ollama")
-    
+    #agent = ModularAgent(model_name="llm/Gemma-4-26B-A4B-JANG_2L-CRACK",provider="vmlx")
+
+    os.environ["DEEPSEEK_API_KEY"] = "sk-f63c1dd24fe040839836d272c20ecca8"
+    agent = ModularAgent(model_name="deepseek-v4-flash", provider="deepseek")
     agent.add_skill(
         name="calculator",
         func=safe_calculate,
