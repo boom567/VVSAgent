@@ -3,6 +3,7 @@ import sys
 import os
 import io
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -12,6 +13,7 @@ if str(ROOT) not in sys.path:
 from aiagent import ModularAgent, ToolApprovalPending  # noqa: E402
 
 CONFIG_FILE = ROOT / "agent_config.json"
+SESSIONS_FILE = ROOT / "agent_chat_sessions.json"
 
 PROVIDER_NAMES = ["deepseek", "openai", "ollama", "vmlx"]
 
@@ -113,6 +115,155 @@ class AgentBridge:
         self.agent.tool_approval_handler = self._request_tool_approval
 
         apply_entry_to_agent(self.agent, active_entry)
+        self.sessions = {}
+        self.current_session_id = ""
+        self._load_sessions()
+        self._apply_current_session_to_agent()
+
+    def _now_iso(self) -> str:
+        return datetime.utcnow().isoformat() + "Z"
+
+    def _new_session_title(self) -> str:
+        return f"会话 {len(self.sessions) + 1}"
+
+    def _first_user_message_snippet(self, history: list) -> str:
+        for item in history or []:
+            if str(item.get("role", "")) != "user":
+                continue
+            content = str(item.get("content", "")).strip()
+            if not content or content.startswith("Observation:") or content.startswith("Error in Agent loop:"):
+                continue
+            return content[:24]
+        return ""
+
+    def _make_session(self, title: str = "") -> dict:
+        now = self._now_iso()
+        return {
+            "id": f"session-{uuid.uuid4().hex}",
+            "title": title.strip() or self._new_session_title(),
+            "created_at": now,
+            "updated_at": now,
+            "history": [],
+            "messages": [],
+        }
+
+    def _session_summary(self, session: dict) -> dict:
+        history = session.get("history") or []
+        user_turns = 0
+        for item in history:
+            if str(item.get("role", "")) == "user":
+                content = str(item.get("content", ""))
+                if not content.startswith("Observation:") and not content.startswith("Error in Agent loop:"):
+                    user_turns += 1
+        return {
+            "id": session.get("id", ""),
+            "title": session.get("title", ""),
+            "updated_at": session.get("updated_at", ""),
+            "created_at": session.get("created_at", ""),
+            "user_turns": user_turns,
+        }
+
+    def _persist_sessions(self):
+        payload = {
+            "current_session_id": self.current_session_id,
+            "sessions": list(self.sessions.values()),
+        }
+        SESSIONS_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _load_sessions(self):
+        data = None
+        if SESSIONS_FILE.exists():
+            try:
+                data = json.loads(SESSIONS_FILE.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                data = None
+
+        sessions = {}
+        if isinstance(data, dict):
+            for raw in data.get("sessions", []) or []:
+                sid = str(raw.get("id", "")).strip()
+                if not sid:
+                    continue
+                sessions[sid] = {
+                    "id": sid,
+                    "title": str(raw.get("title", "")).strip() or "会话",
+                    "created_at": str(raw.get("created_at", "")).strip() or self._now_iso(),
+                    "updated_at": str(raw.get("updated_at", "")).strip() or self._now_iso(),
+                    "history": raw.get("history", []) if isinstance(raw.get("history", []), list) else [],
+                    "messages": raw.get("messages", []) if isinstance(raw.get("messages", []), list) else [],
+                }
+
+        if not sessions:
+            session = self._make_session()
+            sessions[session["id"]] = session
+
+        current_session_id = ""
+        if isinstance(data, dict):
+            current_session_id = str(data.get("current_session_id", "")).strip()
+        if current_session_id not in sessions:
+            current_session_id = next(iter(sessions.keys()))
+
+        self.sessions = sessions
+        self.current_session_id = current_session_id
+        self._persist_sessions()
+
+    def _get_current_session(self) -> dict:
+        session = self.sessions.get(self.current_session_id)
+        if session:
+            return session
+        session = self._make_session()
+        self.sessions[session["id"]] = session
+        self.current_session_id = session["id"]
+        self._persist_sessions()
+        return session
+
+    def _save_agent_history_to_current_session(self):
+        session = self._get_current_session()
+        session["history"] = json.loads(json.dumps(self.agent.history, ensure_ascii=False))
+        snippet = self._first_user_message_snippet(session["history"])
+        if snippet and session.get("title", "").startswith("会话 "):
+            session["title"] = snippet
+        session["updated_at"] = self._now_iso()
+        self._persist_sessions()
+
+    def _apply_current_session_to_agent(self):
+        session = self._get_current_session()
+        self.agent.history = json.loads(json.dumps(session.get("history", []), ensure_ascii=False))
+
+    def _append_session_message(self, role: str, text: str, is_error: bool = False):
+        session = self._get_current_session()
+        messages = session.get("messages") or []
+        messages.append({
+            "role": role,
+            "text": str(text),
+            "is_error": bool(is_error),
+            "ts": self._now_iso(),
+        })
+        session["messages"] = messages[-300:]
+        session["updated_at"] = self._now_iso()
+
+    def _list_sessions_payload(self):
+        ordered = sorted(
+            self.sessions.values(),
+            key=lambda x: str(x.get("updated_at", "")),
+            reverse=True,
+        )
+        return {
+            "type": "list_sessions",
+            "ok": True,
+            "current_session_id": self.current_session_id,
+            "sessions": [self._session_summary(item) for item in ordered],
+        }
+
+    def _ensure_active_session_exists(self):
+        if self.current_session_id in self.sessions:
+            return
+        if self.sessions:
+            self.current_session_id = next(iter(self.sessions.keys()))
+            return
+        session = self._make_session()
+        self.sessions[session["id"]] = session
+        self.current_session_id = session["id"]
 
     def _request_tool_approval(self, tool_name: str, params: dict, prompt_text: str):
         approval_id = f"approval-{uuid.uuid4().hex}"
@@ -169,10 +320,14 @@ class AgentBridge:
             if not text:
                 return {"type": "answer", "ok": False, "error": "empty question"}
 
+            self._append_session_message("user", text)
+
             try:
                 thought_before = self.agent.last_thought
                 action_before = self.agent.last_action
                 answer = self.agent.run(text, reset_history=False)
+                self._append_session_message("agent", str(answer), False)
+                self._save_agent_history_to_current_session()
                 return {
                     "type": "answer",
                     "ok": True,
@@ -181,8 +336,11 @@ class AgentBridge:
                     "action": self.agent.last_action if self.agent.last_action != action_before else None,
                 }
             except ToolApprovalPending:
+                self._save_agent_history_to_current_session()
                 return self._approval_required_response()
             except Exception as exc:
+                self._append_session_message("agent", str(exc), True)
+                self._save_agent_history_to_current_session()
                 return {"type": "answer", "ok": False, "error": str(exc)}
 
         if msg_type == "tool_approval":
@@ -202,6 +360,8 @@ class AgentBridge:
                 thought_before = self.agent.last_thought
                 action_before = self.agent.last_action
                 answer = self.agent.resume_pending_approval(approved=(decision == "allow"))
+                self._append_session_message("agent", str(answer), False)
+                self._save_agent_history_to_current_session()
                 return {
                     "type": "answer",
                     "ok": True,
@@ -210,13 +370,110 @@ class AgentBridge:
                     "action": self.agent.last_action if self.agent.last_action != action_before else None,
                 }
             except ToolApprovalPending:
+                self._save_agent_history_to_current_session()
                 return self._approval_required_response()
             except Exception as exc:
+                self._append_session_message("agent", str(exc), True)
+                self._save_agent_history_to_current_session()
                 return {"type": "answer", "ok": False, "error": str(exc)}
 
         if msg_type == "reset":
             self.agent.history = []
+            self.pending_approval = None
+            session = self._get_current_session()
+            session["history"] = []
+            session["messages"] = []
+            session["updated_at"] = self._now_iso()
+            self._persist_sessions()
             return {"type": "reset", "ok": True}
+
+        if msg_type == "list_sessions":
+            return self._list_sessions_payload()
+
+        if msg_type == "create_session":
+            self._save_agent_history_to_current_session()
+            title = str(payload.get("title", "")).strip()
+            session = self._make_session(title)
+            self.sessions[session["id"]] = session
+            self.current_session_id = session["id"]
+            self.pending_approval = None
+            self.agent.history = []
+            self._persist_sessions()
+            return {
+                "type": "create_session",
+                "ok": True,
+                "current_session_id": self.current_session_id,
+                "messages": session.get("messages", []),
+            }
+
+        if msg_type == "switch_session":
+            target_id = str(payload.get("session_id", "")).strip()
+            if not target_id:
+                return {"type": "switch_session", "ok": False, "error": "session_id is required"}
+            target = self.sessions.get(target_id)
+            if not target:
+                return {"type": "switch_session", "ok": False, "error": "session not found"}
+
+            self._save_agent_history_to_current_session()
+            self.current_session_id = target_id
+            self.pending_approval = None
+            self._apply_current_session_to_agent()
+            target["updated_at"] = self._now_iso()
+            self._persist_sessions()
+            return {
+                "type": "switch_session",
+                "ok": True,
+                "current_session_id": self.current_session_id,
+                "messages": target.get("messages", []),
+            }
+
+        if msg_type == "rename_session":
+            target_id = str(payload.get("session_id", "")).strip()
+            title = str(payload.get("title", "")).strip()
+            if not target_id:
+                return {"type": "rename_session", "ok": False, "error": "session_id is required"}
+            if not title:
+                return {"type": "rename_session", "ok": False, "error": "title is required"}
+            target = self.sessions.get(target_id)
+            if not target:
+                return {"type": "rename_session", "ok": False, "error": "session not found"}
+            target["title"] = title[:60]
+            target["updated_at"] = self._now_iso()
+            self._persist_sessions()
+            return {
+                "type": "rename_session",
+                "ok": True,
+                "session": self._session_summary(target),
+            }
+
+        if msg_type == "delete_session":
+            target_id = str(payload.get("session_id", "")).strip()
+            if not target_id:
+                return {"type": "delete_session", "ok": False, "error": "session_id is required"}
+            target = self.sessions.get(target_id)
+            if not target:
+                return {"type": "delete_session", "ok": False, "error": "session not found"}
+
+            current_before_delete = self.current_session_id
+            if current_before_delete == target_id:
+                self._save_agent_history_to_current_session()
+
+            self.sessions.pop(target_id, None)
+            self._ensure_active_session_exists()
+            self.pending_approval = None
+
+            if current_before_delete == target_id:
+                self._apply_current_session_to_agent()
+
+            active = self._get_current_session()
+            active["updated_at"] = self._now_iso()
+            self._persist_sessions()
+            return {
+                "type": "delete_session",
+                "ok": True,
+                "current_session_id": self.current_session_id,
+                "messages": active.get("messages", []),
+            }
 
         if msg_type == "ping":
             return {"type": "pong", "ok": True}
