@@ -1,8 +1,8 @@
-from aiagent import ModularAgent, safe_calculate
+from aiagent import build_agent_from_config, safe_calculate
 
 
 if __name__ == "__main__":
-    agent = ModularAgent(model_name="deepseek-v3.1:671b-cloud", provider="ollama")
+    agent = build_agent_from_config()
     agent.add_skill(
         name="calculator",
         func=safe_calculate,

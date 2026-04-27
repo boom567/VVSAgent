@@ -8,6 +8,7 @@ import re
 import os
 import base64
 import mimetypes
+import getpass
 from urllib import request, error
 from pathlib import Path
 
@@ -18,6 +19,163 @@ if importlib.util.find_spec("prompt_toolkit"):
 else:
     def prompt(prompt_text):
         return input(prompt_text)
+
+
+AGENT_CONFIG_PATH = Path(__file__).resolve().parent / "agent_config.json"
+DEFAULT_PROVIDER_SETUP = {
+    "ollama": {
+        "model": "llama3",
+        "endpoint": "http://127.0.0.1:11434",
+        "requires_api_key": False,
+    },
+    "deepseek": {
+        "model": "deepseek-v4-flash",
+        "endpoint": "https://api.deepseek.com",
+        "requires_api_key": True,
+    },
+    "openai": {
+        "model": "gpt-4o-mini",
+        "endpoint": "https://api.openai.com/v1",
+        "requires_api_key": True,
+    },
+    "vmlx": {
+        "model": "llm/Gemma-4-26B-A4B-JANG_2L-CRACK",
+        "endpoint": "http://127.0.0.1:8080",
+        "requires_api_key": False,
+    },
+}
+
+
+def _build_default_agent_config(current_provider: str = "ollama"):
+    providers = {}
+    for provider_name, defaults in DEFAULT_PROVIDER_SETUP.items():
+        providers[provider_name] = {
+            "model": defaults["model"],
+            "api_key": "",
+            "endpoint": defaults["endpoint"],
+        }
+    return {
+        "current_provider": current_provider,
+        "providers": providers,
+    }
+
+
+def _normalize_agent_config(raw):
+    base = _build_default_agent_config()
+    if not isinstance(raw, dict):
+        return base
+
+    normalized = _build_default_agent_config(raw.get("current_provider", "ollama"))
+    current_provider = str(raw.get("current_provider", "")).strip().lower()
+    if current_provider in DEFAULT_PROVIDER_SETUP:
+        normalized["current_provider"] = current_provider
+
+    # New structure: providers as a dictionary.
+    providers_dict = raw.get("providers") if isinstance(raw.get("providers"), dict) else None
+    if providers_dict:
+        for provider_name in DEFAULT_PROVIDER_SETUP:
+            provider_raw = providers_dict.get(provider_name, {})
+            if not isinstance(provider_raw, dict):
+                continue
+            model = str(provider_raw.get("model", "")).strip()
+            api_key = str(provider_raw.get("api_key", "")).strip()
+            endpoint = str(provider_raw.get("endpoint", "")).strip()
+            if model:
+                normalized["providers"][provider_name]["model"] = model
+            if endpoint:
+                normalized["providers"][provider_name]["endpoint"] = endpoint
+            normalized["providers"][provider_name]["api_key"] = api_key
+
+    # Backward compatibility: old structure used providers as an array.
+    providers_list = raw.get("providers") if isinstance(raw.get("providers"), list) else []
+    for item in providers_list:
+        if not isinstance(item, dict):
+            continue
+        provider_name = str(item.get("provider", "")).strip().lower()
+        if provider_name not in DEFAULT_PROVIDER_SETUP:
+            continue
+        model = str(item.get("model", "")).strip()
+        api_key = str(item.get("api_key", "")).strip()
+        endpoint = str(item.get("endpoint", "")).strip()
+        if model:
+            normalized["providers"][provider_name]["model"] = model
+        if endpoint:
+            normalized["providers"][provider_name]["endpoint"] = endpoint
+        normalized["providers"][provider_name]["api_key"] = api_key
+
+    if normalized["current_provider"] not in DEFAULT_PROVIDER_SETUP:
+        normalized["current_provider"] = "ollama"
+    return normalized
+
+
+def load_agent_config(config_path: Path | None = None):
+    target = config_path or AGENT_CONFIG_PATH
+    if not target.exists():
+        return None
+    try:
+        raw = json.loads(target.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return _normalize_agent_config(raw)
+
+
+def save_agent_config(config_data, config_path: Path | None = None):
+    target = config_path or AGENT_CONFIG_PATH
+    normalized = _normalize_agent_config(config_data)
+    target.write_text(json.dumps(normalized, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _ask_with_default(prompt_text: str, default_value: str):
+    value = prompt(f"{prompt_text} [{default_value}]: ").strip()
+    return value or default_value
+
+
+def _ask_provider_choice():
+    providers = list(DEFAULT_PROVIDER_SETUP.keys())
+    print("\n请选择供应商:")
+    for index, provider_name in enumerate(providers, start=1):
+        print(f"{index}. {provider_name}")
+
+    while True:
+        raw = prompt("输入序号或名称 (默认 1): ").strip().lower()
+        if not raw:
+            return providers[0]
+        if raw.isdigit():
+            number = int(raw)
+            if 1 <= number <= len(providers):
+                return providers[number - 1]
+        if raw in DEFAULT_PROVIDER_SETUP:
+            return raw
+        print("无效输入，请重新输入。")
+
+
+def run_first_time_setup_wizard(config_path: Path | None = None):
+    print("\n[Setup] First-time model configuration")
+    selected_provider = _ask_provider_choice()
+    defaults = DEFAULT_PROVIDER_SETUP[selected_provider]
+
+    model_name = _ask_with_default("模型名称", defaults["model"])
+    endpoint = _ask_with_default("服务地址", defaults["endpoint"])
+    api_key = ""
+    if defaults["requires_api_key"]:
+        api_key = getpass.getpass("API Key (输入时不显示，可留空后续再配): ").strip()
+
+    config_data = _build_default_agent_config(current_provider=selected_provider)
+    config_data["providers"][selected_provider]["model"] = model_name
+    config_data["providers"][selected_provider]["endpoint"] = endpoint
+    config_data["providers"][selected_provider]["api_key"] = api_key
+
+    save_agent_config(config_data, config_path=config_path)
+    print(f"[Setup] Configuration saved to: {config_path or AGENT_CONFIG_PATH}")
+    return config_data
+
+
+def resolve_or_create_agent_config(config_path: Path | None = None):
+    target = config_path or AGENT_CONFIG_PATH
+    config_data = load_agent_config(target)
+    if config_data:
+        return config_data
+    return run_first_time_setup_wizard(config_path=target)
 
 # ===========================================
 # 1. 技能注册中心 (Skill Registry)
@@ -329,6 +487,9 @@ class ModularAgent:
         self.last_action = None
         self.tool_approval_handler = None
         self.pending_tool_call = None
+        self.provider_models = {}
+        self.config_path = AGENT_CONFIG_PATH
+        self.auto_persist_config = False
         print("model:", model_name)
         # 默认注册系统命令工具
         self.registry.register(
@@ -338,6 +499,62 @@ class ModularAgent:
             parameters={"command": "string"}
         )
         self.load_skills()
+
+    def apply_agent_config(self, config_data):
+        normalized = _normalize_agent_config(config_data)
+        self.provider_models = {}
+
+        for provider_name, values in normalized.get("providers", {}).items():
+            adapter = self.provider_adapters.get(provider_name)
+            if not adapter:
+                continue
+
+            saved_model = str(values.get("model", "")).strip()
+            if saved_model:
+                self.provider_models[provider_name] = saved_model
+
+            saved_endpoint = str(values.get("endpoint", "")).strip()
+            if saved_endpoint:
+                try:
+                    adapter.set_base_url(saved_endpoint)
+                except Exception:
+                    pass
+
+            saved_key = str(values.get("api_key", "")).strip()
+            if adapter.supports_api_key() and saved_key:
+                adapter.set_api_key(saved_key)
+
+        saved_provider = self._normalize_provider_name(normalized.get("current_provider", ""))
+        if saved_provider:
+            self.provider = saved_provider
+
+        saved_model_for_provider = self.provider_models.get(self.provider, "").strip()
+        if saved_model_for_provider:
+            self.model_name = saved_model_for_provider
+
+    def _build_agent_config_snapshot(self):
+        snapshot = _build_default_agent_config(current_provider=self.provider)
+        for provider_name, adapter in self.provider_adapters.items():
+            provider_item = snapshot["providers"][provider_name]
+            provider_item["endpoint"] = adapter.get_endpoint()
+            provider_item["model"] = self.provider_models.get(provider_name) or provider_item["model"]
+            if adapter.supports_api_key():
+                provider_item["api_key"] = getattr(adapter, "api_key", "") or ""
+
+        snapshot["providers"][self.provider]["model"] = self.model_name
+        return snapshot
+
+    def enable_config_persistence(self, config_path: Path | None = None):
+        self.config_path = config_path or AGENT_CONFIG_PATH
+        self.auto_persist_config = True
+
+    def _persist_agent_config(self):
+        if not self.auto_persist_config:
+            return
+        try:
+            save_agent_config(self._build_agent_config_snapshot(), self.config_path)
+        except Exception as exc:
+            print(f"[Config] Failed to save config: {exc}")
 
     def add_skill(self, name, func, description, parameters):
         self.registry.register(name, func, description, parameters)
@@ -413,8 +630,17 @@ class ModularAgent:
         normalized = self._normalize_provider_name(provider_name)
         if not normalized:
             return f"Unsupported provider. Use: {self._supported_provider_names()}"
+
+        current_model = (self.model_name or "").strip()
+        if current_model:
+            self.provider_models[self.provider] = current_model
+
         self.provider = normalized
+        provider_model = (self.provider_models.get(normalized, "") or "").strip()
+        if provider_model:
+            self.model_name = provider_model
         self._clear_model_availability_cache()
+        self._persist_agent_config()
         return f"LLM provider switched to: {self.provider}"
 
     def _set_api_key(self, key: str, provider_name: str = ""):
@@ -426,13 +652,26 @@ class ModularAgent:
             target_provider = normalized
 
         adapter = self.provider_adapters[target_provider]
-        return adapter.set_api_key(key)
+        result = adapter.set_api_key(key)
+        self._persist_agent_config()
+        return result
 
     def _set_base_url(self, base_url: str):
         adapter = self._get_active_provider_adapter()
         result = adapter.set_base_url(base_url)
         self._clear_model_availability_cache()
+        self._persist_agent_config()
         return result
+
+    def _set_model_name(self, model_name: str):
+        value = (model_name or "").strip()
+        if not value:
+            return "Model name cannot be empty."
+        self.model_name = value
+        self.provider_models[self.provider] = value
+        self._clear_model_availability_cache()
+        self._persist_agent_config()
+        return f"Model set to: {self.model_name}"
 
     def _get_provider_status(self):
         adapter = self._get_active_provider_adapter()
@@ -1022,7 +1261,7 @@ Example Final Answer:
     def chat_loop(self):
         print("AI Agent console started.")
         print(f"Current user: {self.current_user}")
-        print("Commands: /help, /reset, /voice, /voice-config, /proviƒder, /apikey, /endpoint, /user <name>, /whoami, /autosave, /exit")
+        print("Commands: /help, /reset, /voice, /voice-config, /provider, /model, /apikey, /endpoint, /user <name>, /whoami, /autosave, /exit")
 
         while True:
             try:
@@ -1044,6 +1283,7 @@ Example Final Answer:
                 print("/voice Enter continuous voice conversation mode")
                 print("/voice-config Show or update voice settings for the current user")
                 print(f"/provider Show or switch LLM provider: {self._supported_provider_names()}")
+                print("/model Show or set model name for current provider")
                 print("/apikey Configure API key: /apikey <key> or /apikey <provider> <key>")
                 print("/endpoint Configure provider endpoint/host URL")
                 print("/user <name> Switch the active user profile")
@@ -1053,6 +1293,7 @@ Example Final Answer:
                 print("In voice mode, say 退出对话 to exit the voice conversation.")
                 print("Example: /voice-config language=zh-CN voice=Tingting rate=210")
                 print("Example: /provider deepseek")
+                print("Example: /model deepseek-v4-flash")
                 print("Example: /apikey sk-xxxx")
                 print("Ask normal questions directly. If a command is needed, the agent will ask for confirmation.")
                 continue
@@ -1092,6 +1333,15 @@ Example Final Answer:
                 result = self._set_provider(parts[1])
                 print(f"Agent> {result}")
                 print(self._get_provider_status())
+                continue
+
+            if user_input.startswith("/model"):
+                parts = user_input.split(maxsplit=1)
+                if len(parts) == 1:
+                    print(f"Agent> Current model: {self._get_active_model_name()}")
+                    continue
+                result = self._set_model_name(parts[1])
+                print(f"Agent> {result}")
                 continue
 
             if user_input.startswith("/apikey"):
@@ -1198,17 +1448,23 @@ def safe_calculate(expression: str):
     parsed = ast.parse(expression, mode="eval")
     return str(evaluate(parsed))
 
+
+def build_agent_from_config(config_path: Path | None = None):
+    config_data = resolve_or_create_agent_config(config_path=config_path)
+    active_provider = config_data.get("current_provider", "ollama")
+    active_provider_settings = config_data.get("providers", {}).get(active_provider, {})
+    model_name = (active_provider_settings.get("model") or "llama3").strip() or "llama3"
+
+    agent = ModularAgent(model_name=model_name, provider=active_provider)
+    agent.apply_agent_config(config_data)
+    agent.enable_config_persistence(config_path=config_path or AGENT_CONFIG_PATH)
+    return agent
+
 # ===========================================
 # 4. 测试与扩展演示
 # ===========================================
 if __name__ == "__main__":
-    #agent = (model_name="gemma4:26b")
-    #agent = ModularAgent(model_name="deepseek-v3.1:671b-cloud",provider="ollama") 
-    #agent = ModularAgent(model_name="gpt-oss:120b-cloud",provider="ollama")
-    #agent = ModularAgent(model_name="llm/Gemma-4-26B-A4B-JANG_2L-CRACK",provider="vmlx")
-
-    os.environ["DEEPSEEK_API_KEY"] = "sk-f63c1dd24fe040839836d272c20ecca8"
-    agent = ModularAgent(model_name="deepseek-v4-flash", provider="deepseek")
+    agent = build_agent_from_config(config_path=AGENT_CONFIG_PATH)
     agent.add_skill(
         name="calculator",
         func=safe_calculate,
