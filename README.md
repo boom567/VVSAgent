@@ -21,7 +21,13 @@ This repository now includes a CLI-Anything bridge skill, so the agent can use m
 conda activate agent
 ```
 
-### 2) Run the agent
+### 2) Install Python dependencies
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+### 3) Run the agent
 
 ```bash
 python aiagent.py
@@ -33,7 +39,7 @@ Or use scripts:
 ./agentStart
 ```
 
-### 3) Run coding agent
+### 4) Run coding agent
 
 ```bash
 python coding_agent.py
@@ -145,6 +151,17 @@ ca_blender(command_args="render execute output.png --overwrite")
 - Scene editing and JSON operations can work without launching Blender UI.
 - Real render/export operations require `blender` executable to be available.
 - Some unrelated optional skills may fail to load if dependencies are missing (for example `openpyxl`, `sounddevice`).
+
+## Dependency Troubleshooting
+
+- If `sounddevice` install fails on macOS, ensure PortAudio is installed first:
+
+```bash
+brew install portaudio
+python -m pip install sounddevice
+```
+
+- If mouse/keyboard automation is blocked, grant Accessibility permission to your terminal (or Python process) in macOS System Settings.
 
 ## Key Files
 

@@ -1,0 +1,11 @@
+# Core runtime
+ollama
+prompt_toolkit
+
+# Built-in skills
+openpyxl
+pyautogui
+numpy
+sounddevice
+soundfile
+SpeechRecognition
