@@ -1,0 +1,3 @@
+[submodule "CLI-Anything"]
+	path = CLI-Anything
+	url = git@github.com:HKUDS/CLI-Anything.git
