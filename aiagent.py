@@ -480,7 +480,7 @@ class ModularAgent:
         self.client = self
         self.registry = SkillRegistry()
         self.history = []
-        self.max_iterations = 16
+        self.max_iterations = 100
         self.current_user = "default"
         self.auto_memory_enabled = True
         self.last_thought = ""
