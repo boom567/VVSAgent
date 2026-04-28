@@ -1,0 +1,76 @@
+{
+  "name": "vvsagant",
+  "displayName": "VVSAgant",
+  "description": "Chat with your local Python agent from VS Code.",
+  "version": "0.2.2",
+  "icon": "icon.png",
+  "publisher": "zhuanz",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/boom567/VVSAgent.git"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Chat",
+    "Other"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "vvsagant.open",
+        "title": "VVSAgant: Open Chat"
+      },
+      {
+        "command": "vvsagant.reset",
+        "title": "VVSAgant: Reset Conversation"
+      }
+    ],
+    "configuration": {
+      "title": "VVSAgant",
+      "properties": {
+        "vvsagant.pythonPath": {
+          "type": "string",
+          "default": "python",
+          "description": "Python executable used to start the bridge process."
+        },
+        "vvsagant.bridgeScript": {
+          "type": "string",
+          "default": "agent_server_bridge.py",
+          "description": "Bridge script path relative to workspace root."
+        }
+      }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "vvsagant-sidebar",
+          "title": "VVSAgant",
+          "icon": "icon.png"
+        }
+      ]
+    },
+    "views": {
+      "vvsagant-sidebar": [
+        {
+          "type": "webview",
+          "id": "vvsagant.chatView",
+          "name": "Chat"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.12",
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^3.7.1",
+    "typescript": "^5.4.5"
+  }
+}

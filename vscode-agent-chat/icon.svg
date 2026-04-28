@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#6366f1"/>
+      <stop offset="100%" stop-color="#4f46e5"/>
+    </linearGradient>
+  </defs>
+  <!-- 圆角方形背景 -->
+  <rect x="8" y="8" width="112" height="112" rx="24" ry="24" fill="url(#bg)"/>
+  <!-- 聊天气泡 -->
+  <path d="M36 46c0-5.5 4.5-10 10-10h36c5.5 0 10 4.5 10 10v24c0 5.5-4.5 10-10 10H62l-16 12v-12h-2c-5.5 0-10-4.5-10-10V46z" fill="#fff" opacity="0.95"/>
+  <!-- 终端提示符 > -->
+  <path d="M54 56l-8 8 8 8" stroke="#4f46e5" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  <path d="M64 72h14" stroke="#4f46e5" stroke-width="3.5" stroke-linecap="round" fill="none"/>
+  <!-- 右下角小装饰: 代表 AI/智能的星星 -->
+  <circle cx="96" cy="96" r="18" fill="#a5b4fc" opacity="0.4"/>
+  <path d="M96 88l2 4 4.5 1-4.5 1-2 4-2-4-4.5-1 4.5-1 2-4z" fill="#fff" opacity="0.9"/>
+</svg>
